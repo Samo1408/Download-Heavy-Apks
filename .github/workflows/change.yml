@@ -1,0 +1,135 @@
+name: APK Processor and Uploader
+
+on:
+  workflow_dispatch:
+    inputs:
+      apk_url:
+        description: 'URL to the APKs/APKM/APKX file'
+        required: true
+        type: string
+      include_patterns:
+        description: 'File patterns to include (e.g., base.apk,split_config.arm64_v8a.apk)'
+        required: false
+        type: string
+        default: 'base.apk'
+      compression_type:
+        description: 'Compression type (zip or tar.gz)'
+        required: false
+        type: choice
+        options:
+          - zip
+          - tar.gz
+        default: 'zip'
+      processed_name:
+        description: 'Optional name for the processed output file (without extension)'
+        required: false
+        type: string
+        default: 'processed_app'
+      upload_destination:
+        description: 'Upload destination (artifacts or release)'
+        required: false
+        type: choice
+        options:
+          - artifacts
+          - release
+        default: 'artifacts'
+      release_tag:
+        description: 'Release tag (e.g., v1.0.0)'
+        required: false
+        type: string
+        default: 'v1.0.0'
+
+jobs:
+  process_and_upload:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip python3 zip curl wget
+
+      - name: Download APK file
+        run: |
+          wget -U "Mozilla/5.0" -O downloaded_file "${{ github.event.inputs.apk_url }}"
+          
+      - name: Extract APK file
+        run: |
+          mkdir extracted_apk
+          unzip downloaded_file -d extracted_apk || (cp downloaded_file temp.zip && unzip temp.zip -d extracted_apk)
+
+      - name: Process Files and Generate Metadata
+        id: process
+        run: |
+          mkdir -p processed_apk
+          # Copy included files
+          IFS=',' read -ra ADDR <<< "${{ github.event.inputs.include_patterns }}"
+          for i in "${ADDR[@]}"; do
+            find extracted_apk -maxdepth 2 -iname "*$i*" -exec cp {} processed_apk/ \;
+          done
+
+          # Generate metadata files via Python
+          python3 - <<EOF
+          import os, hashlib, json, zipfile
+          dir_path = "processed_apk"
+          
+          # 1. base.digests
+          digests = []
+          for f in sorted(os.listdir(dir_path)):
+              if f.lower().endswith(".apk"):
+                  h = hashlib.sha256(open(os.path.join(dir_path, f), "rb").read()).hexdigest()
+                  digests.append(f"{f}:{h}")
+          with open(os.path.join(dir_path, "base.digests"), "w") as f:
+              f.write("\n".join(digests))
+          
+          # 2. app.metadata (Simple version)
+          metadata = {"status": "processed", "tool": "GitHub-APK-Processor"}
+          with open(os.path.join(dir_path, "app.metadata"), "w") as f:
+              json.dump(metadata, f, indent=4)
+
+          # 3. base.dm
+          if any(f.lower() == "base.apk" for f in os.listdir(dir_path)):
+              with open("primary.prof", "wb") as f: f.write(b"")
+              with zipfile.ZipFile(os.path.join(dir_path, "base.dm"), 'w') as zipf:
+                  zipf.write("primary.prof", "primary.prof")
+          EOF
+
+      - name: Re-compress
+        id: recompress
+        run: |
+          OUTPUT_NAME="${{ github.event.inputs.processed_name }}"
+          if [ "${{ github.event.inputs.compression_type }}" == "zip" ]; then
+            cd processed_apk && zip -r "../$OUTPUT_NAME.zip" . && cd ..
+            echo "file=$OUTPUT_NAME.zip" >> $GITHUB_OUTPUT
+          else
+            cd processed_apk && tar -czf "../$OUTPUT_NAME.tar.gz" . && cd ..
+            echo "file=$OUTPUT_NAME.tar.gz" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload as Artifact
+        if: ${{ github.event.inputs.upload_destination == 'artifacts' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.recompress.outputs.file }}
+          path: ${{ steps.recompress.outputs.file }}
+
+      - name: Create Release
+        if: ${{ github.event.inputs.upload_destination == 'release' }}
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.event.inputs.release_tag }}
+          name: Release ${{ github.event.inputs.release_tag }}
+          files: ${{ steps.recompress.outputs.file }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
