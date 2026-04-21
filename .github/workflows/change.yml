@@ -1,4 +1,4 @@
-name: APK Processor and Uploader
+name: APK Extractor and Uploader With Change Name
 
 on:
   workflow_dispatch:
